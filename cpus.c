@@ -51,7 +51,7 @@
 #include "hw/nmi.h"
 #include "sysemu/replay.h"
 #include "hw/boards.h"
-
+#include <syscall.h>
 #ifdef CONFIG_LINUX
 
 #include <sys/prctl.h>
@@ -1301,7 +1301,10 @@ static void deal_with_unplugged_cpus(void)
  * This is done explicitly rather than relying on side-effects
  * elsewhere.
  */
-
+extern int vxAFL_wants_cpu_to_stop;
+extern CPUState * vxAFL_last_cpu;
+extern int vxAFL_notify_pipe[];
+extern void vxAFL_notify_handler(void *ctx);
 static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
 {
     CPUState *cpu = arg;
@@ -1330,13 +1333,13 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
     }
 
     start_tcg_kick_timer();
-
+    current_cpu = first_cpu; // 因为vxAFL_last_cpu中保存的thread还是之前的
     cpu = first_cpu;
 
     /* process any pending work */
     cpu->exit_request = 1;
 
-    while (1) {
+    while (!vxAFL_wants_cpu_to_stop) {
         /* Account partial waits to QEMU_CLOCK_VIRTUAL.  */
         qemu_account_warp_timer();
 
@@ -1394,6 +1397,23 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
 
         qemu_tcg_wait_io_event(cpu ? cpu : QTAILQ_FIRST(&cpus));
         deal_with_unplugged_cpus();
+    }
+
+    if (vxAFL_wants_cpu_to_stop) {
+        printf("[+] Now cpu is stop\n");
+        vxAFL_last_cpu = first_cpu; // 保存原来的cpu
+        vxAFL_wants_cpu_to_stop = 0;
+        if (write(vxAFL_notify_pipe[1], "FORK", 4) != 4) {
+            printf("[-] notify pipe error, %s\n", strerror(errno));
+        }
+        qemu_mutex_unlock_iothread();
+        printf("[+] After notify pipe\n");
+        vxAFL_notify_pipe[1] = -1;
+        cpu_disable_ticks();
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            qemu_wait_io_event_common(cpu);
+        }
     }
 
     return NULL;
@@ -1658,12 +1678,11 @@ void cpu_remove_sync(CPUState *cpu)
 
 /* For temporary buffers for forming a name */
 #define VCPU_THREAD_NAME_SIZE 16
-
-static void qemu_tcg_init_vcpu(CPUState *cpu)
+QemuThread *single_tcg_cpu_thread;
+void qemu_tcg_init_vcpu(CPUState *cpu)
 {
     char thread_name[VCPU_THREAD_NAME_SIZE];
     static QemuCond *single_tcg_halt_cond;
-    static QemuThread *single_tcg_cpu_thread;
 
     if (qemu_tcg_mttcg_enabled() || !single_tcg_cpu_thread) {
         cpu->thread = g_malloc0(sizeof(QemuThread));
@@ -1682,6 +1701,7 @@ static void qemu_tcg_init_vcpu(CPUState *cpu)
         } else {
             /* share a single thread for all cpus with TCG */
             snprintf(thread_name, VCPU_THREAD_NAME_SIZE, "ALL CPUs/TCG");
+            printf("[+] Tcg mode: %s\n", thread_name);
             qemu_thread_create(cpu->thread, thread_name,
                                qemu_tcg_rr_cpu_thread_fn,
                                cpu, QEMU_THREAD_JOINABLE);
@@ -1756,6 +1776,13 @@ static void qemu_dummy_start_vcpu(CPUState *cpu)
 
 void qemu_init_vcpu(CPUState *cpu)
 {
+    // 初始化pipe用于通知
+    if (pipe(vxAFL_notify_pipe) == -1) {
+        perror("[-] vxAFL notify pipe");
+        exit(-1);
+    }
+    qemu_set_fd_handler(vxAFL_notify_pipe[0], vxAFL_notify_handler, NULL, NULL);
+
     cpu->nr_cores = smp_cores;
     cpu->nr_threads = smp_threads;
     cpu->stopped = true;

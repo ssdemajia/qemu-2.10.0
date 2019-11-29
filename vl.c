@@ -131,7 +131,7 @@ int main(int argc, char **argv)
 #include "sysemu/replay.h"
 #include "qapi/qmp/qerror.h"
 #include "sysemu/iothread.h"
-
+#include <syscall.h>
 #define MAX_VIRTIO_CONSOLES 1
 #define MAX_SCLP_CONSOLES 1
 
@@ -188,7 +188,8 @@ bool boot_strict;
 uint8_t *boot_splash_filedata;
 size_t boot_splash_filedata_size;
 uint8_t qemu_extra_params_fw[2];
-
+const char* vxWorks_path = NULL; // vxWorks内核文件地址
+const char* fuzz_entry = NULL; // 用于fuzz的起点
 int icount_align_option;
 
 /* The bytes in qemu_uuid are in the order specified by RFC4122, _not_ in the
@@ -3146,6 +3147,14 @@ int main(int argc, char **argv, char **envp)
                 exit(1);
             }
             switch(popt->index) {
+            case QEMU_OPTION_vxworks: {
+                vxWorks_path = optarg;
+                break;
+            }
+            case QEMU_OPTION_fuzz_entry: {
+                fuzz_entry = optarg;
+                break;
+            }
             case QEMU_OPTION_no_kvm_irqchip: {
                 olist = qemu_find_opts("machine");
                 qemu_opts_parse_noisily(olist, "kernel_irqchip=off", false);
@@ -4174,7 +4183,7 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    cpu_exec_init_all();
+    cpu_exec_init_all(); // 初始化内存
 
     if (machine_class->hw_version) {
         qemu_set_hw_version(machine_class->hw_version);
@@ -4787,7 +4796,9 @@ int main(int argc, char **argv, char **envp)
     }
 
     os_setup_post();
-
+    
+    vxAFL_init();
+    printf("[+] Main loop in thread:%d\n", syscall(__NR_gettid));
     main_loop();
     replay_disable_events();
     iothread_stop_all();

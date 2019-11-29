@@ -53,6 +53,7 @@ typedef struct SyncClocks {
 #define THRESHOLD_REDUCE 1.5
 #define MAX_DELAY_PRINT_RATE 2000000000LL
 #define MAX_NB_PRINTS 100
+extern void vxAFL_run(CPUState *cpu, TranslationBlock *itb);
 
 static void align_clocks(SyncClocks *sc, const CPUState *cpu)
 {
@@ -186,6 +187,8 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
             assert(cc->set_pc);
             cc->set_pc(cpu, last_tb->pc);
         }
+    } else {
+        vxAFL_run(cpu, itb); // 进入vxAFL区域
     }
     return ret;
 }
@@ -365,6 +368,7 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
             if (!tb) {
                 /* if no translated code available, then translate it now */
                 tb = tb_gen_code(cpu, pc, cs_base, flags, 0);
+                // 翻译得到一个translated block
             }
 
             mmap_unlock();
@@ -435,6 +439,7 @@ static inline void cpu_handle_debug_exception(CPUState *cpu)
     cc->debug_excp_handler(cpu);
 }
 
+// 处理异常
 static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 {
     if (cpu->exception_index >= 0) {
@@ -485,6 +490,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
     return false;
 }
 
+// 处理中断
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
