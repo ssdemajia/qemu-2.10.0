@@ -1,33 +1,5 @@
-/*
-   american fuzzy lop - high-performance binary-only instrumentation
-   -----------------------------------------------------------------
-
-   Written by Andrew Griffiths <agriffiths@google.com> and
-              Michal Zalewski <lcamtuf@google.com>
-
-   Idea & design very much by Andrew Griffiths.
-
-   Copyright 2015, 2016 Google Inc. All rights reserved.
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at:
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-   This code is a shim patched into the separately-distributed source
-   code of QEMU 2.2.0. It leverages the built-in QEMU tracing functionality
-   to implement AFL-style instrumentation and to take care of the remaining
-   parts of the AFL fork server logic.
-
-   The resulting QEMU binary is essentially a standalone instrumentation
-   tool; for an example of how to leverage it for other purposes, you can
-   have a look at afl-showmap.c.
-
- */
-
 #include <sys/shm.h>
-// #include "afl.h"
+
 #include "../../config.h"
 
 /***************************
@@ -67,9 +39,19 @@ target_ulong  afl_entry_point = 0x30d4d0, /* ELF entry point (_start) */
       afl_start_code = 0,  /* .text start pointer      */
       afl_end_code = 0x30d54c;    /* .text end pointer        */
 
+int aflChildrenStatus = 0; // 子线程执行的状态
 int aflStart = 0;               /* we've started fuzzing */
 int aflEnableTicks = 0;         /* re-enable ticks for each test */
 int aflGotLog = 0;              /* we've seen dmesg logging */
+typedef enum AFL_STATUS{
+  AFL_WAITTING = 1,
+  AFL_START,
+  AFL_DOING,
+  AFL_RESTART,
+  AFL_DONE
+} AFL_STATUS;
+
+AFL_STATUS aflStatus = AFL_WAITTING;
 
 /* from command line options */
 const char *aflFile = "/tmp/work";
@@ -113,7 +95,6 @@ struct afl_tsl {
 /* Set up SHM region and initialize other stuff. */
 
 void afl_setup(void) {
-
   char *id_str = getenv(SHM_ENV_VAR),
        *inst_r = getenv("AFL_INST_RATIO");
 
@@ -147,13 +128,12 @@ void afl_setup(void) {
 
   }
 
-  if (getenv("AFL_INST_LIBS")) {
+  // if (getenv("AFL_INST_LIBS")) {
 
-    afl_start_code = 0;
-    afl_end_code   = (target_ulong)-1;
+  //   afl_start_code = 0;
+  //   afl_end_code   = (target_ulong)-1;
 
-  }
-
+  // }
 }
 
 static ssize_t uninterrupted_read(int fd, void *buf, size_t cnt)
@@ -249,8 +229,8 @@ static inline target_ulong aflHash(target_ulong cur_loc)
   /* Optimize for cur_loc > afl_end_code, which is the most likely case on
      Linux systems. */
 
-  if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
-    return 0;
+  // if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
+  //   return 0;
 
 #ifdef DEBUG_EDGES
   if(1) {
@@ -298,34 +278,30 @@ static inline void helper_aflMaybeLog(target_ulong cur_loc) {
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(target_ulong cur_loc) {
+  if (aflStatus != AFL_DOING) return;
   cur_loc = aflHash(cur_loc);
   if(cur_loc)
     helper_aflMaybeLog(cur_loc);
 }
 
 static void afl_check_pc(target_ulong pc) {
-  if(pc == afl_entry_point && pc && !aflStart) {
-    printf("FUCK\n");
+  if(pc == afl_entry_point && pc && aflStatus == AFL_WAITTING) {
     aflStart = 1;
+    aflStatus = AFL_START;
     afl_wants_cpu_to_stop = 1;
   }
-  // if (pc == afl_end_code || pc ==) {
-  //   printf("FUCK2\n");
-  //   exit(0);
-  // }
-  else if (aflStart && afl_forksrv_pid) {
-    printf("Child pc:%x\n", pc);
-    if (pc == 0x40a490) {
-      printf("idle\n");
-      exit(0);
+  else if (aflStatus == AFL_DOING) {
+    if (pc == 0x40a250) {
+      // printf("idleEnter\n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 0;
+      aflStatus = AFL_DONE;
     }
-    if (pc == 0x40a27b) {
-      printf("idleEnter\n");
-      exit(0);
-    }
-    if (pc == 0x40cd8a) {
-      printf("reschedule\n");
-      exit(0);
+    if (pc == 0x40cb30) {
+      // printf("reschedule\n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 0;
+      aflStatus = AFL_DONE;
     }
   }
   
@@ -392,3 +368,54 @@ static void afl_wait_tsl(CPUArchState *env, int fd) {
 
 }
 
+CPUArchState backupCPUState; // 用于保持的cpu状态
+CPUTLBEntry backupTLBTable[3][256];
+
+void StoreCPUState(CPUState* state, CPUArchState* env) {
+  for (int i = 0; i < CPU_NB_REGS; i++) {
+    backupCPUState.regs[i] = env->regs[i];
+  }
+  backupCPUState.eip = env->eip;
+  backupCPUState.eflags = env->eflags;
+  backupCPUState.cc_dst = env->cc_dst;
+  backupCPUState.cc_src = env->cc_src;
+  backupCPUState.cc_src2 = env->cc_src2;
+  backupCPUState.cc_op = env->cc_op;
+  backupCPUState.df = env->df;
+  backupCPUState.hflags = env->hflags;
+  backupCPUState.a20_mask = env->a20_mask;
+  for (int i = 0; i < 5; i++) {
+    backupCPUState.cr[i] = env->cr[i];
+  }
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 256; j++) {
+      backupTLBTable[i][j].addr_code = env->tlb_table[i][j].addr_code;
+      backupTLBTable[i][j].addr_write = env->tlb_table[i][j].addr_write;
+      backupTLBTable[i][j].addr_read = env->tlb_table[i][j].addr_read;
+      backupTLBTable[i][j].addend = env->tlb_table[i][j].addend;
+    }
+  }
+}
+
+void LoadCPUState(CPUArchState* env) {
+  for (int i = 0; i < CPU_NB_REGS; i++) {
+    env->regs[i] = backupCPUState.regs[i];
+  }
+  env->eip = backupCPUState.eip;
+  env->eflags = backupCPUState.eflags;
+  env->cc_dst = backupCPUState.cc_dst;
+  env->cc_src = backupCPUState.cc_src;
+  env->cc_src2 = backupCPUState.cc_src2;
+  env->cc_op = backupCPUState.cc_op;
+  env->df = backupCPUState.df;
+  env->hflags = backupCPUState.hflags;
+  env->a20_mask = backupCPUState.a20_mask;
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 256; j++) {
+      env->tlb_table[i][j].addr_code = backupTLBTable[i][j].addr_code;
+      env->tlb_table[i][j].addr_write = backupTLBTable[i][j].addr_write;
+      env->tlb_table[i][j].addr_read = backupTLBTable[i][j].addr_read;
+      env->tlb_table[i][j].addend = backupTLBTable[i][j].addend;
+    }
+  }
+}
