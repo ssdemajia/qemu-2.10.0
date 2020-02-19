@@ -35,7 +35,7 @@
 #endif
 #include "sysemu/cpus.h"
 #include "sysemu/replay.h"
-
+#include "afl-qemu.h"
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -186,6 +186,8 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
             assert(cc->set_pc);
             cc->set_pc(cpu, last_tb->pc);
         }
+    } else {
+        AFL_QEMU_CPU_SNIPPET2(env, itb->pc);
     }
     return ret;
 }
@@ -204,6 +206,7 @@ static void cpu_exec_nocache(CPUState *cpu, int max_cycles,
         max_cycles = CF_COUNT_MASK;
 
     tb_lock();
+
     tb = tb_gen_code(cpu, orig_tb->pc, orig_tb->cs_base, orig_tb->flags,
                      max_cycles | CF_NOCACHE
                          | (ignore_icount ? CF_IGNORE_ICOUNT : 0));
@@ -484,10 +487,11 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
 
     return false;
 }
-
+extern CPUState* restart_cpu;
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
+    // if (restart_cpu) return true;
     CPUClass *cc = CPU_GET_CLASS(cpu);
 
     if (unlikely(atomic_read(&cpu->interrupt_request))) {
