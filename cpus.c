@@ -1339,6 +1339,9 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
     /* process any pending work */
     cpu->exit_request = 1;
 
+    unsigned int afl_forksrv_pid = getpid();
+    static unsigned char tmp[4];
+
     while (1) {
         /* Account partial waits to QEMU_CLOCK_VIRTUAL.  */
         qemu_account_warp_timer();
@@ -1366,7 +1369,7 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
                 int r;
 
                 prepare_icount_for_run(cpu);
-                restart_cpu = cpu;
+                current_cpu = cpu;
                 r = tcg_cpu_exec(cpu);
 
                 process_icount_data(cpu);
@@ -1398,18 +1401,29 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
         }
         if (afl_wants_cpu_to_stop) {
             afl_wants_cpu_to_stop = 0;
-            restart_cpu = first_cpu;
             if (aflStatus == AFL_START) {
-                // printf("[SSSS]Send 'STAR' to pipe\n");
-                if (write(afl_qemuloop_pipe[1], "STAR", 4) != 4) {
-                    perror("[SSSS]can't write 'STAR' afl_qemuloop_pipe");
-                }
+                // printf("[SSSS]Send 'STAR' to pipe----------------\n");
+                restart_cpu = first_cpu;
+                aflStatus = AFL_DOING;
+                /* 通知afl，当前进程仍然存活 */
+                if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
             } 
             else if (aflStatus == AFL_DONE) {
-                // printf("[SSSS]Send 'DONE' to pipe\n");
-                if (write(afl_qemuloop_pipe[1], "DONE", 4) != 4) {
-                    perror("[SSSS]can't write 'DONE' afl_qemuloop_pipe");
+                // printf("[SSSS]Send 'DONE' to pipe----------------\n");
+                /* Whoops, parent dead? */
+                if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
+                if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) exit(5);
+                afl_forksrv_pid += 1;
+                if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
+                    printf("[SSSS]forkserver want to communicate afl failed\n");
+                    exit(7);
                 }
+                current_cpu = restart_cpu;
+                first_cpu = restart_cpu;
+                LoadCPUState(current_cpu->env_ptr);
+                LoadTestCase(current_cpu->env_ptr);
+                
+                aflStatus = AFL_DOING;
             }
         }
         qemu_tcg_wait_io_event(cpu ? cpu : QTAILQ_FIRST(&cpus));
@@ -1779,36 +1793,40 @@ static void qemu_dummy_start_vcpu(CPUState *cpu)
 static void pipeNotification(void* ctx)
 {
     static unsigned char tmp[4];
-    // printf("[SSSS]Enter pipeNotification\n");
+    printf("[SSSS]Enter pipeNotification\n");
     char buf[4];
     if (read(afl_qemuloop_pipe[0], buf, 4) != 4) {
         perror("[SSSS]can't read");
         exit(-1);
     }
     if (!strncmp(buf, "STAR", 4)) {
-        // printf("[SSSS]START\n");
-        afl_setup();
+        printf("[SSSS]START\n");
+        // afl_setup();
         /* 通知afl，forkserver建立了 */
-        if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
-        current_cpu = restart_cpu;
-        first_cpu = restart_cpu;
-        StoreCPUState(restart_cpu, restart_cpu->env_ptr);
-        aflStatus = AFL_DOING;
-    } 
+        // if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+        // current_cpu = restart_cpu;
+        // first_cpu = restart_cpu;
+        // StoreCPUState(restart_cpu, restart_cpu->env_ptr);
+        // LoadTestCase(current_cpu);
+        aflStatus = AFL_GETWORK;
+        afl_wants_cpu_to_stop = 0;
+    }
     else if (!strncmp(buf, "DONE", 4)) {
-        // printf("[SSSS]DONE\n");
+        printf("[SSSS]DONE\n");
         int afl_forksrv_pid = getpid() + 1;
         /* 查看afl是否存活 */
-        if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
-        if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) exit(5);
-        if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
-            printf("[SSSS]forkserver want to communicate afl failed\n");
-            exit(7);
-        }
+        // if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
+        // if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) exit(5);
+        // if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
+        //     printf("[SSSS]forkserver want to communicate afl failed\n");
+        //     exit(7);
+        // }
         current_cpu = restart_cpu;
         first_cpu = restart_cpu;
         LoadCPUState(current_cpu->env_ptr);
-        aflStatus = AFL_DOING;
+        // LoadTestCase(current_cpu);
+        aflStatus = AFL_GETWORK;
+        afl_wants_cpu_to_stop = 0;
     }
 }
 void qemu_init_vcpu(CPUState *cpu)

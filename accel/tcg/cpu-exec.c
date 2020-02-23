@@ -187,7 +187,7 @@ static inline tcg_target_ulong cpu_tb_exec(CPUState *cpu, TranslationBlock *itb)
             cc->set_pc(cpu, last_tb->pc);
         }
     } else {
-        AFL_QEMU_CPU_SNIPPET2(env, itb->pc);
+        AFL_QEMU_CPU_SNIPPET2(env, env->eip);
     }
     return ret;
 }

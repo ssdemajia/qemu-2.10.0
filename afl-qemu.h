@@ -1,7 +1,8 @@
 #include <sys/shm.h>
 
 #include "../../config.h"
-
+#include "qemu/osdep.h"
+#include "exec/cpu_ldst.h"
 /***************************
  * VARIOUS AUXILIARY STUFF *
  ***************************/
@@ -20,7 +21,7 @@
    regular instrumentation injected via afl-as.h. */
 
 #define AFL_QEMU_CPU_SNIPPET2(env, pc) do { \
-    afl_check_pc(pc); \
+    afl_check_pc(env, pc); \
     afl_maybe_log(pc); \
   } while (0)
 
@@ -48,11 +49,12 @@ typedef enum AFL_STATUS{
   AFL_START,
   AFL_DOING,
   AFL_RESTART,
-  AFL_DONE
+  AFL_DONE,
+  AFL_GETWORK
 } AFL_STATUS;
 
 AFL_STATUS aflStatus = AFL_WAITTING;
-
+GHashTable* aflMemHT = NULL;
 /* from command line options */
 const char *aflFile = "/tmp/work";
 unsigned long aflPanicAddr = (unsigned long)-1;
@@ -69,7 +71,7 @@ unsigned int afl_forksrv_pid;
 static unsigned int afl_inst_rms = MAP_SIZE;
 
 /* Function declarations. */
-static void afl_check_pc(target_ulong);
+static void afl_check_pc(CPUArchState* env, target_ulong);
 static inline void afl_maybe_log(target_ulong);
 
 static void afl_wait_tsl(CPUArchState*, int);
@@ -78,7 +80,97 @@ static void afl_request_tsl(target_ulong, target_ulong, uint64_t);
 static TranslationBlock *tb_find_slow(CPUArchState*, target_ulong,
                                       target_ulong, uint64_t);
 
+CPUArchState backupCPUState; // 用于保持的cpu状态
+CPUTLBEntry backupTLBTable[3][256];
 
+void StoreCPUState(CPUArchState* env) {
+  printf("[SSSS]Store CPU State\n");
+  for (int i = 0; i < CPU_NB_REGS; i++) {
+    backupCPUState.regs[i] = env->regs[i];
+  }
+  backupCPUState.eip = env->eip;
+  backupCPUState.eflags = env->eflags;
+  backupCPUState.cc_dst = env->cc_dst;
+  backupCPUState.cc_src = env->cc_src;
+  backupCPUState.cc_src2 = env->cc_src2;
+  backupCPUState.cc_op = env->cc_op;
+  backupCPUState.df = env->df;
+  backupCPUState.hflags = env->hflags;
+  backupCPUState.a20_mask = env->a20_mask;
+  for (int i = 0; i < 5; i++) {
+    backupCPUState.cr[i] = env->cr[i];
+  }
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 256; j++) {
+      backupTLBTable[i][j].addr_code = env->tlb_table[i][j].addr_code;
+      backupTLBTable[i][j].addr_write = env->tlb_table[i][j].addr_write;
+      backupTLBTable[i][j].addr_read = env->tlb_table[i][j].addr_read;
+      backupTLBTable[i][j].addend = env->tlb_table[i][j].addend;
+    }
+  }
+}
+static void
+myIterator(gpointer key, gpointer value, gpointer env)
+{
+    // cpu_stl_data_ra(current_cpu->env_ptr, *(uint32_t*)key, *(uint32_t*)value, NULL);
+    // printf(user_data, *(gint*)key, value);
+}
+void LoadCPUState(CPUArchState* env) {
+  for (int i = 0; i < CPU_NB_REGS; i++) {
+    env->regs[i] = backupCPUState.regs[i];
+  }
+  env->eip = backupCPUState.eip;
+  env->eflags = backupCPUState.eflags;
+  env->cc_dst = backupCPUState.cc_dst;
+  env->cc_src = backupCPUState.cc_src;
+  env->cc_src2 = backupCPUState.cc_src2;
+  env->cc_op = backupCPUState.cc_op;
+  env->df = backupCPUState.df;
+  env->hflags = backupCPUState.hflags;
+  env->a20_mask = backupCPUState.a20_mask;
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 256; j++) {
+      env->tlb_table[i][j].addr_code = backupTLBTable[i][j].addr_code;
+      env->tlb_table[i][j].addr_write = backupTLBTable[i][j].addr_write;
+      env->tlb_table[i][j].addr_read = backupTLBTable[i][j].addr_read;
+      env->tlb_table[i][j].addend = backupTLBTable[i][j].addend;
+    }
+  }
+  g_hash_table_foreach(aflMemHT, myIterator, env);
+  // g_hash_table_remove_all(aflMemHT);
+}
+
+FILE *afl_fp = NULL;
+void LoadTestCase(CPUArchState* env) {
+  // printf("[SSSS]load testcase\n");
+  const char* filepath = "/home/ss/work/vxafl/test_input.txt";
+  // uintptr_t ra = GETPC();
+  // printf("esp addr:%x, eip addr:%x\n", env->regs[R_ESP], env->eip);
+  // target_long ret_ptr = cpu_ldl_data_ra(env, env->regs[R_ESP], NULL);
+  // printf("ret addr:%x\n", ret_ptr);
+  // target_long ptr = cpu_ldl_data_ra(env, env->regs[R_ESP+4], NULL);
+  // printf("arg addr:%x\n", ret_ptr);
+
+  // // FILE *fp;
+  // if (!afl_fp)
+  //   afl_fp = fopen(filepath, "rb");
+  // if (!afl_fp) {
+  //   perror("Can't open file");
+  //   exit(-1);
+  // }
+  // fseek(afl_fp, 0, SEEK_END);
+  // size_t sz = ftell(afl_fp);
+  // fseek(afl_fp, 0, SEEK_SET);
+  // char ch = 0;
+  // for (int i = 0; i < sz; i++) {
+  //   printf("%c", ch);
+  //   if (fread(&ch, 1, 1, afl_fp) == 0) {
+  //     break;
+  //   }
+  //   cpu_stb_data_ra(env, ptr, ch, ra);
+  // }
+  // printf("\n");
+}
 /* Data structure passed around by the translate handlers: */
 
 struct afl_tsl {
@@ -86,6 +178,7 @@ struct afl_tsl {
   target_ulong cs_base;
   uint64_t flags;
 };
+
 
 
 /*************************
@@ -127,13 +220,6 @@ void afl_setup(void) {
 
 
   }
-
-  // if (getenv("AFL_INST_LIBS")) {
-
-  //   afl_start_code = 0;
-  //   afl_end_code   = (target_ulong)-1;
-
-  // }
 }
 
 static ssize_t uninterrupted_read(int fd, void *buf, size_t cnt)
@@ -278,17 +364,24 @@ static inline void helper_aflMaybeLog(target_ulong cur_loc) {
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(target_ulong cur_loc) {
-  if (aflStatus != AFL_DOING) return;
-  cur_loc = aflHash(cur_loc);
-  if(cur_loc)
-    helper_aflMaybeLog(cur_loc);
+  // return;
+  if (aflStatus == AFL_START || aflStatus == AFL_DOING) {
+    cur_loc = aflHash(cur_loc);
+    if(cur_loc)
+      helper_aflMaybeLog(cur_loc);
+  }
 }
 
-static void afl_check_pc(target_ulong pc) {
+static void afl_check_pc(CPUArchState* env, target_ulong pc) {
   if(pc == afl_entry_point && pc && aflStatus == AFL_WAITTING) {
     aflStart = 1;
     aflStatus = AFL_START;
     afl_wants_cpu_to_stop = 1;
+    // printf("[SSSS]AFLSTART pc is %x\n", pc);
+    aflMemHT = g_hash_table_new(g_int_hash, g_int_equal);
+    afl_setup();
+    StoreCPUState(env);
+    LoadTestCase(env);
   }
   else if (aflStatus == AFL_DOING) {
     if (pc == 0x40a250) {
@@ -304,7 +397,6 @@ static void afl_check_pc(target_ulong pc) {
       aflStatus = AFL_DONE;
     }
   }
-  
 }
 /* This code is invoked whenever QEMU decides that it doesn't have a
    translation of a particular block and needs to compute it. When this happens,
@@ -368,54 +460,21 @@ static void afl_wait_tsl(CPUArchState *env, int fd) {
 
 }
 
-CPUArchState backupCPUState; // 用于保持的cpu状态
-CPUTLBEntry backupTLBTable[3][256];
+#define AFL_TRACE_GETPC() ((void *)((unsigned long)__builtin_return_address(0) - 1))
 
-void StoreCPUState(CPUState* state, CPUArchState* env) {
-  for (int i = 0; i < CPU_NB_REGS; i++) {
-    backupCPUState.regs[i] = env->regs[i];
-  }
-  backupCPUState.eip = env->eip;
-  backupCPUState.eflags = env->eflags;
-  backupCPUState.cc_dst = env->cc_dst;
-  backupCPUState.cc_src = env->cc_src;
-  backupCPUState.cc_src2 = env->cc_src2;
-  backupCPUState.cc_op = env->cc_op;
-  backupCPUState.df = env->df;
-  backupCPUState.hflags = env->hflags;
-  backupCPUState.a20_mask = env->a20_mask;
-  for (int i = 0; i < 5; i++) {
-    backupCPUState.cr[i] = env->cr[i];
-  }
-  for (int i = 0; i < 3; i++) {
-    for (int j = 0; j < 256; j++) {
-      backupTLBTable[i][j].addr_code = env->tlb_table[i][j].addr_code;
-      backupTLBTable[i][j].addr_write = env->tlb_table[i][j].addr_write;
-      backupTLBTable[i][j].addr_read = env->tlb_table[i][j].addr_read;
-      backupTLBTable[i][j].addend = env->tlb_table[i][j].addend;
-    }
-  }
+void afl_trace_st(unsigned long host_addr, uint32_t guest_addr, uint32_t value, void *retaddr) {
+    // if (aflStatus == AFL_DOING || aflStatus == AFL_START) {
+    //   if (g_hash_table_lookup(aflMemHT, &guest_addr)) {
+    //     return;
+    //   }
+    //   CPUArchState* env = current_cpu->env_ptr;
+    //   uint32_t cur_value = cpu_ldl_data_ra(env, guest_addr, AFL_TRACE_GETPC());
+    //   // printf("afl_trace store in host:0x%x, guest:0x%x, value:0x%x, cur_value:0x%x\n", host_addr, guest_addr, value, cur_value);
+    //   g_hash_table_insert(aflMemHT, &guest_addr, &cur_value);
+    // }
 }
 
-void LoadCPUState(CPUArchState* env) {
-  for (int i = 0; i < CPU_NB_REGS; i++) {
-    env->regs[i] = backupCPUState.regs[i];
-  }
-  env->eip = backupCPUState.eip;
-  env->eflags = backupCPUState.eflags;
-  env->cc_dst = backupCPUState.cc_dst;
-  env->cc_src = backupCPUState.cc_src;
-  env->cc_src2 = backupCPUState.cc_src2;
-  env->cc_op = backupCPUState.cc_op;
-  env->df = backupCPUState.df;
-  env->hflags = backupCPUState.hflags;
-  env->a20_mask = backupCPUState.a20_mask;
-  for (int i = 0; i < 3; i++) {
-    for (int j = 0; j < 256; j++) {
-      env->tlb_table[i][j].addr_code = backupTLBTable[i][j].addr_code;
-      env->tlb_table[i][j].addr_write = backupTLBTable[i][j].addr_write;
-      env->tlb_table[i][j].addr_read = backupTLBTable[i][j].addr_read;
-      env->tlb_table[i][j].addend = backupTLBTable[i][j].addend;
-    }
-  }
+void afl_trace_tcg_st(unsigned long host_addr, unsigned int guest_addr, unsigned int value)
+{
+    afl_trace_st(host_addr, guest_addr, value, AFL_TRACE_GETPC());
 }

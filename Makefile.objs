@@ -87,7 +87,7 @@ common-obj-y += cpus-common.o
 common-obj-y += hw/
 common-obj-y += qom/
 common-obj-y += disas/
-
+common-obj-y += afl-trace.o
 ######################################################################
 # Resource file for Windows executables
 version-obj-$(CONFIG_WIN32) += $(BUILD_DIR)/version.o

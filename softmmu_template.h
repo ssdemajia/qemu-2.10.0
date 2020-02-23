@@ -338,6 +338,7 @@ void helper_le_st_name(CPUArchState *env, target_ulong addr, DATA_TYPE val,
 #else
     glue(glue(st, SUFFIX), _le_p)((uint8_t *)haddr, val);
 #endif
+    afl_trace_st(haddr, addr, val, retaddr);
 }
 
 #if DATA_SIZE > 1
