@@ -3,18 +3,6 @@
 #include "../../config.h"
 #include "qemu/osdep.h"
 #include "exec/cpu_ldst.h"
-/***************************
- * VARIOUS AUXILIARY STUFF *
- ***************************/
-
-/* A snippet patched into tb_find_slow to inform the parent process that
-   we have hit a new block that hasn't been translated yet, and to tell
-   it to translate within its own context, too (this avoids translation
-   overhead in the next forked-off copy). */
-
-#define AFL_QEMU_CPU_SNIPPET1 do { \
-    afl_request_tsl(pc, cs_base, flags); \
-  } while (0)
 
 /* This snippet kicks in when the instruction pointer is positioned at
    _start and does the usual forkserver stuff, not very different from
@@ -57,7 +45,7 @@ AFL_STATUS aflStatus = AFL_WAITTING;
 GHashTable* aflMemHT = NULL;
 /* from command line options */
 const char *aflFile = "/tmp/work";
-unsigned long aflPanicAddr = (unsigned long)-1;
+unsigned long aflPanicAddr = 0xffffffff8105615a;
 unsigned long aflDmesgAddr = (unsigned long)-1;
 
 /* Set in the child process in forkserver mode: */
@@ -109,12 +97,15 @@ void StoreCPUState(CPUArchState* env) {
     }
   }
 }
+extern CPUState* restart_cpu;
 static void
 myIterator(gpointer key, gpointer value, gpointer env)
 {
-    // cpu_stl_data_ra(current_cpu->env_ptr, *(uint32_t*)key, *(uint32_t*)value, NULL);
-    // printf(user_data, *(gint*)key, value);
+  CPUArchState* arch = (CPUArchState*)env;
+  cpu_stq_data_ra(arch, *(target_long*)key, *(target_long*)value, NULL);
+  printf("fffffffuck");
 }
+
 void LoadCPUState(CPUArchState* env) {
   for (int i = 0; i < CPU_NB_REGS; i++) {
     env->regs[i] = backupCPUState.regs[i];
@@ -142,12 +133,12 @@ void LoadCPUState(CPUArchState* env) {
 
 FILE *afl_fp = NULL;
 void LoadTestCase(CPUArchState* env) {
-  // printf("[SSSS]load testcase\n");
+  printf("[SSSS]load testcase\n");
   const char* filepath = "/home/ss/work/vxafl/test_input.txt";
   // uintptr_t ra = GETPC();
-  // printf("esp addr:%x, eip addr:%x\n", env->regs[R_ESP], env->eip);
-  // target_long ret_ptr = cpu_ldl_data_ra(env, env->regs[R_ESP], NULL);
-  // printf("ret addr:%x\n", ret_ptr);
+  printf("esp addr:%lx, eip addr:%lx\n", env->regs[R_ESP], env->eip);
+  target_long ret_ptr = cpu_ldl_data_ra(env, env->regs[R_ESP], NULL);
+  printf("ret addr:%lx\n", ret_ptr);
   // target_long ptr = cpu_ldl_data_ra(env, env->regs[R_ESP+4], NULL);
   // printf("arg addr:%x\n", ret_ptr);
 
@@ -171,15 +162,6 @@ void LoadTestCase(CPUArchState* env) {
   // }
   // printf("\n");
 }
-/* Data structure passed around by the translate handlers: */
-
-struct afl_tsl {
-  target_ulong pc;
-  target_ulong cs_base;
-  uint64_t flags;
-};
-
-
 
 /*************************
  * ACTUAL IMPLEMENTATION *
@@ -190,24 +172,20 @@ struct afl_tsl {
 void afl_setup(void) {
   char *id_str = getenv(SHM_ENV_VAR),
        *inst_r = getenv("AFL_INST_RATIO");
-
   int shm_id;
 
   if (inst_r) {
 
     unsigned int r;
-
     r = atoi(inst_r);
 
     if (r > 100) r = 100;
     if (!r) r = 1;
 
     afl_inst_rms = MAP_SIZE * r / 100;
-
   }
 
   if (id_str) {
-
     shm_id = atoi(id_str);
     afl_area_ptr = shmat(shm_id, NULL, 0);
 
@@ -228,83 +206,6 @@ static ssize_t uninterrupted_read(int fd, void *buf, size_t cnt)
     while((n = read(fd, buf, cnt)) == -1 && errno == EINTR)
         continue;
     return n;
-}
-
-/* Fork server logic, invoked once we hit _start. */
-
-void afl_forkserver(CPUArchState *env) {
-
-  static unsigned char tmp[4];
-
-  //if (!afl_area_ptr) return;
-
-  /* 通知afl，当前进程仍然存活 */
-  // if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
-
-  afl_forksrv_pid = getpid();
-
-  /* All right, let's await orders... */
-
-  while (1) {
-
-    pid_t child_pid;
-    int status, t_fd[2];
-
-    /* Whoops, parent dead? */
-
-    // if (uninterrupted_read(FORKSRV_FD, tmp, 4) != 4) exit(2);
-
-    /* Establish a channel with child to grab translation commands. We'll 
-       read from t_fd[0], child will write to TSL_FD. */
-
-    // if (pipe(t_fd) || dup2(t_fd[1], TSL_FD) < 0) exit(3);
-    // close(t_fd[1]);
-
-    child_pid = fork();
-    if (child_pid < 0) {
-      printf("[SSSS]forkserver want to fork children failed\n");
-      exit(4);
-    }
-
-    if (!child_pid) {
-
-      /* 子进程. Close descriptors and run free. */
-
-      afl_fork_child = 1;
-      close(FORKSRV_FD);
-      close(FORKSRV_FD + 1);
-      close(t_fd[0]);
-      return;
-
-    }
-
-    /* Parent. */
-
-    // close(TSL_FD);
-
-    // if (write(FORKSRV_FD + 1, &child_pid, 4) != 4) exit(5);
-
-    /* Collect translation requests until child dies and closes the pipe. */
-
-    //afl_wait_tsl(env, t_fd[0]);
-
-    /* Get and relay exit status to parent. */
-    printf("[SSSS]parent waitpid\n");
-    if (waitpid(child_pid, &status, 0) < 0) {
-      printf("[SSSS]forkserver wait children pid failed\n");
-      exit(6);
-    }
-    // if (write(FORKSRV_FD + 1, &status, 4) != 4) {
-    //   printf("[SSSS]forkserver want to communicate afl failed\n");
-    //   exit(7);
-    // }
-    if (WIFSIGNALED(status)) {
-      printf("[SSSS] child exited via signal %d\n", WTERMSIG(status));
-    }
-    printf("[SSSS]forkserver get children status: %x %x\n", status, WEXITSTATUS(status));
-    sleep(1);
-  }
-
 }
 
 static inline target_ulong aflHash(target_ulong cur_loc)
@@ -364,7 +265,7 @@ static inline void helper_aflMaybeLog(target_ulong cur_loc) {
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(target_ulong cur_loc) {
-  // return;
+  return;
   if (aflStatus == AFL_START || aflStatus == AFL_DOING) {
     cur_loc = aflHash(cur_loc);
     if(cur_loc)
@@ -377,104 +278,91 @@ static void afl_check_pc(CPUArchState* env, target_ulong pc) {
     aflStart = 1;
     aflStatus = AFL_START;
     afl_wants_cpu_to_stop = 1;
-    // printf("[SSSS]AFLSTART pc is %x\n", pc);
+    printf("[SSSS]AFLSTART pc is %lx\n", pc);
     aflMemHT = g_hash_table_new(g_int_hash, g_int_equal);
-    afl_setup();
+    // afl_setup();
     StoreCPUState(env);
-    LoadTestCase(env);
+    // LoadTestCase(env);
+    //cpu_breakpoint_insert(cpu, addr, BP_GDB, NULL);
   }
   else if (aflStatus == AFL_DOING) {
+    // printf("[SSSS]DOING pc:0x%lx\n", pc);
     if (pc == 0x40a250) {
-      // printf("idleEnter\n");
+      printf("idleEnter\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
     if (pc == 0x40cb30) {
-      // printf("reschedule\n");
+      printf("reschedule\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-  }
-}
-/* This code is invoked whenever QEMU decides that it doesn't have a
-   translation of a particular block and needs to compute it. When this happens,
-   we tell the parent to mirror the operation, so that the next fork() has a
-   cached copy. */
-
-static void afl_request_tsl(target_ulong pc, target_ulong cb, uint64_t flags) {
-
-  struct afl_tsl t;
-
-  if (!afl_fork_child) return;
-
-  t.pc      = pc;
-  t.cs_base = cb;
-  t.flags   = flags;
-
-  if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
-    return;
-
-}
-
-
-/* This is the other side of the same channel. Since timeouts are handled by
-   afl-fuzz simply killing the child, we can just wait until the pipe breaks. */
-
-static void afl_wait_tsl(CPUArchState *env, int fd) {
-
-  struct afl_tsl t;
-
-  while (1) {
-
-    /* Broken pipe means it's time to return to the fork server routine. */
-
-    if (read(fd, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
-      break;
-
-    if(0 && env) {
-#ifdef CONFIG_USER_ONLY
-        tb_find_slow(env, t.pc, t.cs_base, t.flags);
-#else
-        /* if the child system emulator pages in new code and then JITs it, 
-        and sends its address to the server, the server cannot also JIT it 
-        without having it's guest's kernel page the data in !  
-        so we will only JIT kernel code segment which shouldnt page.
-        */
-        // XXX this monstrosity must go!
-        if(t.pc >= 0xffffffff81000000 && t.pc <= 0xffffffff81ffffff) {
-            //printf("wait_tsl %lx -- jit\n", t.pc); fflush(stdout);
-            tb_find_slow(env, t.pc, t.cs_base, t.flags);
-        } else {
-            //printf("wait_tsl %lx -- ignore nonkernel\n", t.pc); fflush(stdout);
-        }
-#endif
-    } else {
-        //printf("wait_tsl %lx -- ignore\n", t.pc); fflush(stdout);
+    if (pc == 0x00425f40) {
+      printf("Panic\n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 0;
+      aflStatus = AFL_DONE;
     }
-
+    if (pc > afl_entry_point + 4) {
+      printf("More \n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 0;
+      aflStatus = AFL_DONE;
+    }
+    // if (pc == aflPanicAddr) {
+    //   printf("panic \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE; 
+    // }
+    // if (pc >= afl_entry_point + 73) {
+    //   printf("procfs1 end \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE; 
+    // }
+    // if (pc >= 0xffffffff811d21bf) {
+    //   printf("procfs1 ret \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE; 
+    // }
+    // if (pc == 0xffffffff8107f0c2) {
+    //    printf("procfs1 idle \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE; 
+    // }
+    // if (pc == 0xffffffff81085f1b) {
+    //    printf("procfs1 pick_next_entity \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE; 
+    // }
+    if (aflStatus == AFL_DONE) {
+      printf("Done\n");
+      LoadCPUState(env);
+    }
   }
-
-  close(fd);
-
 }
 
 #define AFL_TRACE_GETPC() ((void *)((unsigned long)__builtin_return_address(0) - 1))
 
-void afl_trace_st(unsigned long host_addr, uint32_t guest_addr, uint32_t value, void *retaddr) {
-    // if (aflStatus == AFL_DOING || aflStatus == AFL_START) {
-    //   if (g_hash_table_lookup(aflMemHT, &guest_addr)) {
-    //     return;
-    //   }
-    //   CPUArchState* env = current_cpu->env_ptr;
-    //   uint32_t cur_value = cpu_ldl_data_ra(env, guest_addr, AFL_TRACE_GETPC());
-    //   // printf("afl_trace store in host:0x%x, guest:0x%x, value:0x%x, cur_value:0x%x\n", host_addr, guest_addr, value, cur_value);
-    //   g_hash_table_insert(aflMemHT, &guest_addr, &cur_value);
-    // }
+void afl_trace_st(target_ulong host_addr, target_ulong guest_addr, target_ulong value, void *retaddr) {
+    if (aflStatus == AFL_DOING || aflStatus == AFL_START) {
+      if (g_hash_table_lookup(aflMemHT, &guest_addr)) {
+        return;
+      }
+      CPUArchState* env = current_cpu->env_ptr;
+      target_ulong cur_value = cpu_ldl_data_ra(env, guest_addr, AFL_TRACE_GETPC());
+      printf("afl_trace store in host:0x%lx, guest:0x%lx, value:0x%lx, cur_value:0x%lx\n", host_addr, guest_addr, value, cur_value);
+      g_hash_table_insert(aflMemHT, &guest_addr, &cur_value);
+    }
 }
 
-void afl_trace_tcg_st(unsigned long host_addr, unsigned int guest_addr, unsigned int value)
+void afl_trace_tcg_st(target_ulong host_addr, target_ulong guest_addr, target_ulong value)
 {
     afl_trace_st(host_addr, guest_addr, value, AFL_TRACE_GETPC());
 }
