@@ -1809,7 +1809,7 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is64)
     
     /* TLB Hit.  */
     tcg_out_qemu_st_direct(s, datalo, datahi, TCG_REG_L1, 0, 0, opc);
-    
+    tcg_out_mov(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], addrlo);
     tcg_out_mov(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], datalo);
     tcg_out_call(s, (tcg_target_long)afl_trace_tcg_st);
     /* Record the current context of a store into ldst label */

@@ -8,8 +8,8 @@
    _start and does the usual forkserver stuff, not very different from
    regular instrumentation injected via afl-as.h. */
 
-#define AFL_QEMU_CPU_SNIPPET2(env, pc) do { \
-    afl_check_pc(env, pc); \
+#define AFL_QEMU_CPU_SNIPPET2(cpu, env, pc) do { \
+    afl_check_pc(cpu, env, pc); \
     afl_maybe_log(pc); \
   } while (0)
 
@@ -59,7 +59,7 @@ unsigned int afl_forksrv_pid;
 static unsigned int afl_inst_rms = MAP_SIZE;
 
 /* Function declarations. */
-static void afl_check_pc(CPUArchState* env, target_ulong);
+static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc);
 static inline void afl_maybe_log(target_ulong);
 
 static void afl_wait_tsl(CPUArchState*, int);
@@ -85,6 +85,13 @@ void StoreCPUState(CPUArchState* env) {
   backupCPUState.df = env->df;
   backupCPUState.hflags = env->hflags;
   backupCPUState.a20_mask = env->a20_mask;
+  for (int i = 0; i < 6; i++) {
+    backupCPUState.segs[i] = env->segs[i];
+  }
+  backupCPUState.ldt = env->ldt;
+  backupCPUState.tr = env->tr;
+  backupCPUState.gdt = env->gdt;
+  backupCPUState.idt = env->idt;
   for (int i = 0; i < 5; i++) {
     backupCPUState.cr[i] = env->cr[i];
   }
@@ -96,14 +103,19 @@ void StoreCPUState(CPUArchState* env) {
       backupTLBTable[i][j].addend = env->tlb_table[i][j].addend;
     }
   }
+
+  backupCPUState.sysenter_cs = env->sysenter_cs;
+  backupCPUState.sysenter_esp = env->sysenter_esp;
+  backupCPUState.sysenter_eip = env->sysenter_eip;
+  backupCPUState.star = env->star;
 }
 extern CPUState* restart_cpu;
 static void
 myIterator(gpointer key, gpointer value, gpointer env)
 {
   CPUArchState* arch = (CPUArchState*)env;
-  cpu_stq_data_ra(arch, *(target_long*)key, *(target_long*)value, NULL);
-  printf("fffffffuck");
+  cpu_stl_data_ra(arch, *(target_long*)key, *(target_long*)value, NULL);
+  // printf("[restore]key:%ld, value:%ld\n", *(target_long*)key, *(target_long*)value);
 }
 
 void LoadCPUState(CPUArchState* env) {
@@ -119,6 +131,16 @@ void LoadCPUState(CPUArchState* env) {
   env->df = backupCPUState.df;
   env->hflags = backupCPUState.hflags;
   env->a20_mask = backupCPUState.a20_mask;
+  for (int i = 0; i < 6; i++) {
+    env->segs[i] = backupCPUState.segs[i];
+  }
+  env->ldt = backupCPUState.ldt;
+  env->tr = backupCPUState.tr;
+  env->gdt = backupCPUState.gdt;
+  env->idt = backupCPUState.idt;
+  for (int i = 0; i < 5; i++) {
+    env->cr[i] = backupCPUState.cr[i];
+  }
   for (int i = 0; i < 3; i++) {
     for (int j = 0; j < 256; j++) {
       env->tlb_table[i][j].addr_code = backupTLBTable[i][j].addr_code;
@@ -127,6 +149,12 @@ void LoadCPUState(CPUArchState* env) {
       env->tlb_table[i][j].addend = backupTLBTable[i][j].addend;
     }
   }
+
+  env->sysenter_cs = backupCPUState.sysenter_cs;
+  env->sysenter_esp = backupCPUState.sysenter_esp;
+  env->sysenter_eip = backupCPUState.sysenter_eip;
+  env->star = backupCPUState.star;
+
   g_hash_table_foreach(aflMemHT, myIterator, env);
   // g_hash_table_remove_all(aflMemHT);
 }
@@ -134,33 +162,40 @@ void LoadCPUState(CPUArchState* env) {
 FILE *afl_fp = NULL;
 void LoadTestCase(CPUArchState* env) {
   printf("[SSSS]load testcase\n");
+  
   const char* filepath = "/home/ss/work/vxafl/test_input.txt";
   // uintptr_t ra = GETPC();
   printf("esp addr:%lx, eip addr:%lx\n", env->regs[R_ESP], env->eip);
-  target_long ret_ptr = cpu_ldl_data_ra(env, env->regs[R_ESP], NULL);
+  target_long ret_ptr = cpu_ldl_data(env, env->regs[R_ESP]);
   printf("ret addr:%lx\n", ret_ptr);
-  // target_long ptr = cpu_ldl_data_ra(env, env->regs[R_ESP+4], NULL);
-  // printf("arg addr:%x\n", ret_ptr);
+
+  target_ulong arg_ptr = cpu_ldl_data(env, env->regs[R_ESP]+4);
+  // for (int i = 0; i < 10; i++) {
+  //   target_long ptr = cpu_ldl_data(env, env->regs[R_ESP]+4*i);
+  //   printf("x addr:0x%x, value%x\n", env->regs[R_ESP]+4*i, ptr);
+  // }
+  
 
   // // FILE *fp;
-  // if (!afl_fp)
-  //   afl_fp = fopen(filepath, "rb");
-  // if (!afl_fp) {
-  //   perror("Can't open file");
-  //   exit(-1);
-  // }
-  // fseek(afl_fp, 0, SEEK_END);
-  // size_t sz = ftell(afl_fp);
-  // fseek(afl_fp, 0, SEEK_SET);
-  // char ch = 0;
-  // for (int i = 0; i < sz; i++) {
-  //   printf("%c", ch);
-  //   if (fread(&ch, 1, 1, afl_fp) == 0) {
-  //     break;
-  //   }
-  //   cpu_stb_data_ra(env, ptr, ch, ra);
-  // }
-  // printf("\n");
+  if (!afl_fp)
+    afl_fp = fopen(filepath, "rb");
+  if (!afl_fp) {
+    perror("Can't open file");
+    exit(-1);
+  }
+  fseek(afl_fp, 0, SEEK_END);
+  size_t sz = ftell(afl_fp); // 文件大小
+
+  fseek(afl_fp, 0, SEEK_SET);
+  char ch = 0;
+  for (int i = 0; i < sz; i++) {
+    // printf("%c", ch);
+    if (fread(&ch, 1, 1, afl_fp) == 0) {
+      break;
+    }
+    cpu_stb_data(env, arg_ptr+i, 'A');
+  }
+  printf("args inject %d\n", sz);
 }
 
 /*************************
@@ -198,14 +233,6 @@ void afl_setup(void) {
 
 
   }
-}
-
-static ssize_t uninterrupted_read(int fd, void *buf, size_t cnt)
-{
-    ssize_t n;
-    while((n = read(fd, buf, cnt)) == -1 && errno == EINTR)
-        continue;
-    return n;
 }
 
 static inline target_ulong aflHash(target_ulong cur_loc)
@@ -273,20 +300,22 @@ static inline void afl_maybe_log(target_ulong cur_loc) {
   }
 }
 
-static void afl_check_pc(CPUArchState* env, target_ulong pc) {
+static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc) {
   if(pc == afl_entry_point && pc && aflStatus == AFL_WAITTING) {
+    // cpu_single_step(cpu, true); // 设置为单步执行
     aflStart = 1;
     aflStatus = AFL_START;
-    afl_wants_cpu_to_stop = 1;
+    // afl_wants_cpu_to_stop = 1;
     printf("[SSSS]AFLSTART pc is %lx\n", pc);
     aflMemHT = g_hash_table_new(g_int_hash, g_int_equal);
     // afl_setup();
     StoreCPUState(env);
-    // LoadTestCase(env);
-    //cpu_breakpoint_insert(cpu, addr, BP_GDB, NULL);
+    aflStatus = AFL_DOING;
+    LoadTestCase(env);
+    // cpu_breakpoint_insert(cpu, afl_entry_point, BP_GDB, NULL);
   }
   else if (aflStatus == AFL_DOING) {
-    // printf("[SSSS]DOING pc:0x%lx\n", pc);
+    printf("[SSSS]DOING pc:0x%lx\n", pc);
     if (pc == 0x40a250) {
       printf("idleEnter\n");
       afl_wants_cpu_to_stop = 1;
@@ -305,11 +334,26 @@ static void afl_check_pc(CPUArchState* env, target_ulong pc) {
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-    if (pc > afl_entry_point + 4) {
-      printf("More \n");
+    if (pc == 0x412c40) {
+      printf("Task Lock\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
+    }
+    // if (pc > afl_entry_point + 32) {
+    //   printf("More \n");
+    //   afl_wants_cpu_to_stop = 1;
+    //   aflChildrenStatus = 0;
+    //   aflStatus = AFL_DONE;
+    // }
+    if (pc == 0x3189e0) {
+      printf("excStub0 \n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 23;
+      aflStatus = AFL_DONE;
+    }
+    if (pc == 0xd41a) {
+      exit(1);
     }
     // if (pc == aflPanicAddr) {
     //   printf("panic \n");
@@ -342,27 +386,39 @@ static void afl_check_pc(CPUArchState* env, target_ulong pc) {
     //   aflStatus = AFL_DONE; 
     // }
     if (aflStatus == AFL_DONE) {
-      printf("Done\n");
+      printf("[SSSS]Done\n");
       LoadCPUState(env);
+      aflStatus = AFL_DOING;
+      LoadTestCase(env);
     }
   }
 }
 
 #define AFL_TRACE_GETPC() ((void *)((unsigned long)__builtin_return_address(0) - 1))
 
-void afl_trace_st(target_ulong host_addr, target_ulong guest_addr, target_ulong value, void *retaddr) {
+void afl_trace_st(CPUArchState* env, target_ulong host_addr, target_ulong guest_addr, target_ulong value, void *retaddr) {
     if (aflStatus == AFL_DOING || aflStatus == AFL_START) {
       if (g_hash_table_lookup(aflMemHT, &guest_addr)) {
         return;
       }
-      CPUArchState* env = current_cpu->env_ptr;
-      target_ulong cur_value = cpu_ldl_data_ra(env, guest_addr, AFL_TRACE_GETPC());
-      printf("afl_trace store in host:0x%lx, guest:0x%lx, value:0x%lx, cur_value:0x%lx\n", host_addr, guest_addr, value, cur_value);
-      g_hash_table_insert(aflMemHT, &guest_addr, &cur_value);
+      // CPUArchState* env = current_cpu->env_ptr;
+      target_ulong cur_value = cpu_ldl_data(env, guest_addr);
+      // target_ulong cur_value = 0;
+      target_ulong* value = (target_ulong*)malloc(sizeof(target_ulong));
+      target_ulong* key = (target_ulong*)malloc(sizeof(target_ulong));
+      *key = guest_addr;
+      *value = cur_value;
+      // printf("afl_trace store in host:0x%x, guest:0x%x, value:0x%x, cur_value:0x%x\n", host_addr, guest_addr, value, cur_value);
+      // if (cur_value != value)  {
+      //   printf("afl_trace store in host:0x%x, guest:0x%x, value:0x%x, cur_value:0x%x\n", host_addr, guest_addr, value, cur_value);
+      //   // exit(10);
+      // }
+      g_hash_table_insert(aflMemHT, key, value);
     }
 }
 
-void afl_trace_tcg_st(target_ulong host_addr, target_ulong guest_addr, target_ulong value)
+void afl_trace_tcg_st(CPUArchState *env, target_ulong guest_addr, target_ulong value)
 {
-    afl_trace_st(host_addr, guest_addr, value, AFL_TRACE_GETPC());
+  CPUArchState* eenv = current_cpu->env_ptr;
+  afl_trace_st(eenv, NULL, guest_addr, value, AFL_TRACE_GETPC());
 }
