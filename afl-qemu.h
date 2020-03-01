@@ -52,7 +52,7 @@ unsigned long aflDmesgAddr = (unsigned long)-1;
 
 unsigned char afl_fork_child = 0;
 int afl_wants_cpu_to_stop = 0;
-unsigned int afl_forksrv_pid;
+// unsigned int afl_forksrv_pid;
 
 /* Instrumentation ratio: */
 
@@ -72,7 +72,7 @@ CPUArchState backupCPUState; // 用于保持的cpu状态
 CPUTLBEntry backupTLBTable[3][256];
 
 void StoreCPUState(CPUArchState* env) {
-  printf("[SSSS]Store CPU State\n");
+  // printf("[SSSS]Store CPU State\n");
   for (int i = 0; i < CPU_NB_REGS; i++) {
     backupCPUState.regs[i] = env->regs[i];
   }
@@ -161,13 +161,14 @@ void LoadCPUState(CPUArchState* env) {
 
 FILE *afl_fp = NULL;
 void LoadTestCase(CPUArchState* env) {
-  printf("[SSSS]load testcase\n");
+  // printf("[SSSS]load testcase\n");
   
-  const char* filepath = "/home/ss/work/vxafl/test_input.txt";
+  const char* filepath = "/home/ss/work/vxafl/fuzzout/.cur_input";
+  // const char* filepath = "/home/ss/work/vxafl/test_input.txt";
   // uintptr_t ra = GETPC();
-  printf("esp addr:%lx, eip addr:%lx\n", env->regs[R_ESP], env->eip);
+  // printf("esp addr:%lx, eip addr:%lx\n", env->regs[R_ESP], env->eip);
   target_long ret_ptr = cpu_ldl_data(env, env->regs[R_ESP]);
-  printf("ret addr:%lx\n", ret_ptr);
+  // printf("ret addr:%lx\n", ret_ptr);
 
   target_ulong arg_ptr = cpu_ldl_data(env, env->regs[R_ESP]+4);
   // for (int i = 0; i < 10; i++) {
@@ -193,9 +194,9 @@ void LoadTestCase(CPUArchState* env) {
     if (fread(&ch, 1, 1, afl_fp) == 0) {
       break;
     }
-    cpu_stb_data(env, arg_ptr+i, 'A');
+    cpu_stb_data(env, arg_ptr+i, ch);
   }
-  printf("args inject %d\n", sz);
+  // printf("args inject %d\n", sz);
 }
 
 /*************************
@@ -208,7 +209,6 @@ void afl_setup(void) {
   char *id_str = getenv(SHM_ENV_VAR),
        *inst_r = getenv("AFL_INST_RATIO");
   int shm_id;
-
   if (inst_r) {
 
     unsigned int r;
@@ -292,69 +292,75 @@ static inline void helper_aflMaybeLog(target_ulong cur_loc) {
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(target_ulong cur_loc) {
-  return;
   if (aflStatus == AFL_START || aflStatus == AFL_DOING) {
     cur_loc = aflHash(cur_loc);
     if(cur_loc)
       helper_aflMaybeLog(cur_loc);
   }
 }
-
+unsigned char afl_buffer[4];
 static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc) {
+  static unsigned int afl_forksrv_pid = 0;
+
   if(pc == afl_entry_point && pc && aflStatus == AFL_WAITTING) {
-    // cpu_single_step(cpu, true); // 设置为单步执行
     aflStart = 1;
     aflStatus = AFL_START;
     // afl_wants_cpu_to_stop = 1;
-    printf("[SSSS]AFLSTART pc is %lx\n", pc);
+    afl_forksrv_pid = getpid();
+    // printf("[SSSS]AFLSTART pc is %lx\n", pc);
     aflMemHT = g_hash_table_new(g_int_hash, g_int_equal);
-    // afl_setup();
+    afl_setup();
     StoreCPUState(env);
     aflStatus = AFL_DOING;
     LoadTestCase(env);
-    // cpu_breakpoint_insert(cpu, afl_entry_point, BP_GDB, NULL);
+    /* 通知afl，当前进程仍然存活 */
+    if (write(FORKSRV_FD + 1, "Hi!!", 4) != 4) {
+      printf("[SSSS]通知afl error\n");
+      return;
+    }
   }
   else if (aflStatus == AFL_DOING) {
-    printf("[SSSS]DOING pc:0x%lx\n", pc);
+    // printf("[SSSS]DOING pc:0x%lx\n", pc);
     if (pc == 0x40a250) {
-      printf("idleEnter\n");
+      // printf("idleEnter\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
+    if (pc == 0x3189e0) {
+      // printf("excStub0 \n");
+      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 8;
+      aflStatus = AFL_DONE;
+    }
     if (pc == 0x40cb30) {
-      printf("reschedule\n");
+      // printf("reschedule\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
     if (pc == 0x00425f40) {
-      printf("Panic\n");
+      // printf("Panic\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
     if (pc == 0x412c40) {
-      printf("Task Lock\n");
+      // printf("Task Lock\n");
       afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-    // if (pc > afl_entry_point + 32) {
+    // if (pc > afl_entry_point + 132) {
     //   printf("More \n");
     //   afl_wants_cpu_to_stop = 1;
     //   aflChildrenStatus = 0;
     //   aflStatus = AFL_DONE;
     // }
-    if (pc == 0x3189e0) {
-      printf("excStub0 \n");
-      afl_wants_cpu_to_stop = 1;
-      aflChildrenStatus = 23;
-      aflStatus = AFL_DONE;
-    }
-    if (pc == 0xd41a) {
-      exit(1);
-    }
+    
+    // if (pc == 0xd41a) {
+    //   exit(1);
+    // }
     // if (pc == aflPanicAddr) {
     //   printf("panic \n");
     //   afl_wants_cpu_to_stop = 1;
@@ -385,13 +391,30 @@ static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc) {
     //   aflChildrenStatus = 0;
     //   aflStatus = AFL_DONE; 
     // }
-    if (aflStatus == AFL_DONE) {
-      printf("[SSSS]Done\n");
+  }
+  if (aflStatus == AFL_DONE) {
+      // printf("[SSSS]Done\n");
+      
+      /* Whoops, parent dead? */
+      if (read(FORKSRV_FD, afl_buffer, 4) != 4) {
+        printf("[SSSS]read fork server error\n");
+        exit(2);
+      }
+      // printf("[SSSS]parent alive\n");
+      if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) {
+        printf("[SSSS]write fork server pid error\n");
+        exit(5);
+      }
+      afl_forksrv_pid += 1;
+      if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
+          printf("[SSSS]forkserver want to communicate afl failed\n");
+          exit(7);
+      }
+      aflChildrenStatus = 0;
       LoadCPUState(env);
       aflStatus = AFL_DOING;
       LoadTestCase(env);
     }
-  }
 }
 
 #define AFL_TRACE_GETPC() ((void *)((unsigned long)__builtin_return_address(0) - 1))
@@ -401,9 +424,7 @@ void afl_trace_st(CPUArchState* env, target_ulong host_addr, target_ulong guest_
       if (g_hash_table_lookup(aflMemHT, &guest_addr)) {
         return;
       }
-      // CPUArchState* env = current_cpu->env_ptr;
       target_ulong cur_value = cpu_ldl_data(env, guest_addr);
-      // target_ulong cur_value = 0;
       target_ulong* value = (target_ulong*)malloc(sizeof(target_ulong));
       target_ulong* key = (target_ulong*)malloc(sizeof(target_ulong));
       *key = guest_addr;
