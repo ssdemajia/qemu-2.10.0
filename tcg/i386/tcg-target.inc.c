@@ -23,7 +23,7 @@
  */
 
 #include "tcg-be-ldst.h"
-
+#include "afl.h"
 #ifdef CONFIG_DEBUG_TCG
 static const char * const tcg_target_reg_names[TCG_TARGET_NB_REGS] = {
 #if TCG_TARGET_REG_BITS == 64
@@ -1792,26 +1792,30 @@ static void tcg_out_qemu_st(TCGContext *s, const TCGArg *args, bool is64)
     int mem_index;
     tcg_insn_unit *label_ptr[2];
 #endif
-
+    /* datalo和datahi表示存入的数据 */
     datalo = *args++;
     datahi = (TCG_TARGET_REG_BITS == 32 && is64 ? *args++ : 0);
+    /* addrlo和addrhi表示地址 */
     addrlo = *args++;
     addrhi = (TARGET_LONG_BITS > TCG_TARGET_REG_BITS ? *args++ : 0);
     oi = *args++;
     opc = get_memop(oi);
 
 #if defined(CONFIG_SOFTMMU)
-    mem_index = get_mmuidx(oi);
+    mem_index = get_mmuidx(oi); // 获得MMU中的index
 
     tcg_out_tlb_load(s, addrlo, addrhi, mem_index, opc,
                      label_ptr, offsetof(CPUTLBEntry, addr_write));
-
+    
     /* TLB Hit.  */
     tcg_out_qemu_st_direct(s, datalo, datahi, TCG_REG_L1, 0, 0, opc);
-
+    tcg_out_mov(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[1], addrlo);
+    tcg_out_mov(s, TCG_TYPE_I32, tcg_target_call_iarg_regs[2], datalo);
+    tcg_out_call(s, (tcg_target_long)afl_trace_tcg_st);
     /* Record the current context of a store into ldst label */
     add_qemu_ldst_label(s, false, oi, datalo, datahi, addrlo, addrhi,
                         s->code_ptr, label_ptr);
+    
 #else
     {
         int32_t offset = guest_base;

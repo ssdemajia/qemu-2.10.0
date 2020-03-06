@@ -1247,6 +1247,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     assert_memory_lock();
 
     phys_pc = get_page_addr_code(env, pc);
+    if (phys_pc == 0x31bdb0) {
+        printf("Got!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+    }
     if (use_icount && !(cflags & CF_IGNORE_ICOUNT)) {
         cflags |= CF_USE_ICOUNT;
     }

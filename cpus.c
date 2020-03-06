@@ -51,7 +51,8 @@
 #include "hw/nmi.h"
 #include "sysemu/replay.h"
 #include "hw/boards.h"
-#include <syscall.h>
+#include "afl.h"
+#include "../../config.h"
 #ifdef CONFIG_LINUX
 
 #include <sys/prctl.h>
@@ -1301,12 +1302,11 @@ static void deal_with_unplugged_cpus(void)
  * This is done explicitly rather than relying on side-effects
  * elsewhere.
  */
-extern int vxAFL_wants_cpu_to_stop;
-extern CPUState * vxAFL_last_cpu;
-extern int vxAFL_notify_pipe[];
-extern void vxAFL_notify_handler(void *ctx);
+static int afl_qemuloop_pipe[2];     /* 用于与eventloop通信的管道 */
+CPUState* restart_cpu = NULL; /* 保存cpu状态 */
 static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
 {
+    if (restart_cpu) current_cpu = restart_cpu; // 恢复当前cpu
     CPUState *cpu = arg;
 
     rcu_register_thread();
@@ -1339,7 +1339,10 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
     /* process any pending work */
     cpu->exit_request = 1;
 
-    while (!vxAFL_wants_cpu_to_stop) {
+    unsigned int afl_forksrv_pid = getpid();
+    static unsigned char tmp[4];
+
+    while (1) {
         /* Account partial waits to QEMU_CLOCK_VIRTUAL.  */
         qemu_account_warp_timer();
 
@@ -1352,7 +1355,9 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
             cpu = first_cpu;
         }
 
-        while (cpu && !cpu->queued_work_first && !cpu->exit_request) {
+        while (
+                cpu && !cpu->queued_work_first && 
+               !cpu->exit_request) {
 
             atomic_mb_set(&tcg_current_rr_cpu, cpu);
             current_cpu = cpu;
@@ -1364,7 +1369,7 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
                 int r;
 
                 prepare_icount_for_run(cpu);
-
+                current_cpu = cpu;
                 r = tcg_cpu_exec(cpu);
 
                 process_icount_data(cpu);
@@ -1394,28 +1399,39 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
         if (cpu && cpu->exit_request) {
             atomic_mb_set(&cpu->exit_request, 0);
         }
-
+        if (afl_wants_cpu_to_stop) {
+            afl_wants_cpu_to_stop = 0;
+            // if (aflStatus == AFL_START) {
+            //     printf("[SSSS]Send 'STAR' to pipe----------------\n");
+            //     // restart_cpu = first_cpu;
+            //     printf("FUCK! restart_cpu:%p, cpu:%p\n", restart_cpu, cpu);
+            //     aflStatus = AFL_DOING;
+            //     /* 通知afl，当前进程仍然存活 */
+            //     // if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
+            // } 
+            // else if (aflStatus == AFL_DONE) {
+            //     printf("[SSSS]Send 'DONE' to pipe----------------\n");
+            //     /* Whoops, parent dead? */
+            //     // if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
+            //     // if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) exit(5);
+            //     // afl_forksrv_pid += 1;
+            //     // if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
+            //     //     printf("[SSSS]forkserver want to communicate afl failed\n");
+            //     //     exit(7);
+            //     // }
+            //     current_cpu = restart_cpu;
+            //     first_cpu = restart_cpu;
+            //     LoadCPUState(current_cpu->env_ptr);
+            //     LoadTestCase(current_cpu->env_ptr);
+                
+            //     aflStatus = AFL_DOING;
+            // }
+        }
         qemu_tcg_wait_io_event(cpu ? cpu : QTAILQ_FIRST(&cpus));
         deal_with_unplugged_cpus();
     }
 
-    if (vxAFL_wants_cpu_to_stop) {
-        printf("[+] Now cpu is stop\n");
-        vxAFL_last_cpu = first_cpu; // 保存原来的cpu
-        vxAFL_wants_cpu_to_stop = 0;
-        if (write(vxAFL_notify_pipe[1], "FORK", 4) != 4) {
-            printf("[-] notify pipe error, %s\n", strerror(errno));
-        }
-        qemu_mutex_unlock_iothread();
-        printf("[+] After notify pipe\n");
-        vxAFL_notify_pipe[1] = -1;
-        cpu_disable_ticks();
-        CPUState *cpu;
-        CPU_FOREACH(cpu) {
-            qemu_wait_io_event_common(cpu);
-        }
-    }
-
+    
     return NULL;
 }
 
@@ -1678,13 +1694,14 @@ void cpu_remove_sync(CPUState *cpu)
 
 /* For temporary buffers for forming a name */
 #define VCPU_THREAD_NAME_SIZE 16
-QemuThread *single_tcg_cpu_thread;
-void qemu_tcg_init_vcpu(CPUState *cpu)
+/* 恢复tcg thread */
+static void qemu_tcg_init_vcpu(CPUState *cpu, bool inAFL)
 {
+    
     char thread_name[VCPU_THREAD_NAME_SIZE];
     static QemuCond *single_tcg_halt_cond;
 
-    if (qemu_tcg_mttcg_enabled() || !single_tcg_cpu_thread) {
+    if (qemu_tcg_mttcg_enabled() || !single_tcg_cpu_thread || inAFL) {
         cpu->thread = g_malloc0(sizeof(QemuThread));
         cpu->halt_cond = g_malloc0(sizeof(QemuCond));
         qemu_cond_init(cpu->halt_cond);
@@ -1786,7 +1803,7 @@ void qemu_init_vcpu(CPUState *cpu)
     cpu->nr_cores = smp_cores;
     cpu->nr_threads = smp_threads;
     cpu->stopped = true;
-
+    
     if (!cpu->as) {
         /* If the target cpu hasn't set up any address spaces itself,
          * give it the default one.
@@ -1802,7 +1819,7 @@ void qemu_init_vcpu(CPUState *cpu)
     } else if (hax_enabled()) {
         qemu_hax_start_vcpu(cpu);
     } else if (tcg_enabled()) {
-        qemu_tcg_init_vcpu(cpu);
+        qemu_tcg_init_vcpu(cpu, false);
     } else {
         qemu_dummy_start_vcpu(cpu);
     }
