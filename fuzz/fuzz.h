@@ -19,10 +19,11 @@
 #include "../../config.h"
 
 #define LOG(fmt, ...) printf("[+] " fmt " [%s/%s:%d]\n", ## __VA_ARGS__, __func__, __FILE__, __LINE__)
-#define QEMU_FD (FORKSRV_FD-1)
 
-void vxAFL_notify_handler(void *ctx);
-void vxAFL_init();
-void vxAFL_run(CPUState *cpu, TranslationBlock *itb);
-
+target_ulong vxAFL_entrypoint = 0;
+target_ulong vxAFL_idleEnter = 0;
+target_ulong vxAFL_excStub0 = 0;
+target_ulong vxAFL_excStub = 0;
+target_ulong vxAFL_excPanicShow = 0;
+target_ulong vxAFL_reschedule = 0;
 #endif

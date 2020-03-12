@@ -129,7 +129,7 @@ static int icount_time_shift;
 static QEMUTimer *icount_rt_timer;
 static QEMUTimer *icount_vm_timer;
 static QEMUTimer *icount_warp_timer;
-
+QemuThread *single_tcg_cpu_thread;
 typedef struct TimersState {
     /* Protected by BQL.  */
     int64_t cpu_ticks_prev;
@@ -1302,11 +1302,9 @@ static void deal_with_unplugged_cpus(void)
  * This is done explicitly rather than relying on side-effects
  * elsewhere.
  */
-static int afl_qemuloop_pipe[2];     /* 用于与eventloop通信的管道 */
-CPUState* restart_cpu = NULL; /* 保存cpu状态 */
+
 static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
 {
-    if (restart_cpu) current_cpu = restart_cpu; // 恢复当前cpu
     CPUState *cpu = arg;
 
     rcu_register_thread();
@@ -1398,34 +1396,6 @@ static void *qemu_tcg_rr_cpu_thread_fn(void *arg)
 
         if (cpu && cpu->exit_request) {
             atomic_mb_set(&cpu->exit_request, 0);
-        }
-        if (afl_wants_cpu_to_stop) {
-            afl_wants_cpu_to_stop = 0;
-            // if (aflStatus == AFL_START) {
-            //     printf("[SSSS]Send 'STAR' to pipe----------------\n");
-            //     // restart_cpu = first_cpu;
-            //     printf("FUCK! restart_cpu:%p, cpu:%p\n", restart_cpu, cpu);
-            //     aflStatus = AFL_DOING;
-            //     /* 通知afl，当前进程仍然存活 */
-            //     // if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
-            // } 
-            // else if (aflStatus == AFL_DONE) {
-            //     printf("[SSSS]Send 'DONE' to pipe----------------\n");
-            //     /* Whoops, parent dead? */
-            //     // if (read(FORKSRV_FD, tmp, 4) != 4) exit(2);
-            //     // if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) exit(5);
-            //     // afl_forksrv_pid += 1;
-            //     // if (write(FORKSRV_FD + 1, &aflChildrenStatus, 4) != 4) {
-            //     //     printf("[SSSS]forkserver want to communicate afl failed\n");
-            //     //     exit(7);
-            //     // }
-            //     current_cpu = restart_cpu;
-            //     first_cpu = restart_cpu;
-            //     LoadCPUState(current_cpu->env_ptr);
-            //     LoadTestCase(current_cpu->env_ptr);
-                
-            //     aflStatus = AFL_DOING;
-            // }
         }
         qemu_tcg_wait_io_event(cpu ? cpu : QTAILQ_FIRST(&cpus));
         deal_with_unplugged_cpus();
@@ -1793,13 +1763,6 @@ static void qemu_dummy_start_vcpu(CPUState *cpu)
 
 void qemu_init_vcpu(CPUState *cpu)
 {
-    // 初始化pipe用于通知
-    if (pipe(vxAFL_notify_pipe) == -1) {
-        perror("[-] vxAFL notify pipe");
-        exit(-1);
-    }
-    qemu_set_fd_handler(vxAFL_notify_pipe[0], vxAFL_notify_handler, NULL, NULL);
-
     cpu->nr_cores = smp_cores;
     cpu->nr_threads = smp_threads;
     cpu->stopped = true;

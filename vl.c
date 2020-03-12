@@ -3147,8 +3147,9 @@ int main(int argc, char **argv, char **envp)
                 exit(1);
             }
             switch(popt->index) {
-            case QEMU_OPTION_vxworks: {
+            case QEMU_OPTION_vxworks: { // 处理内核镜像文件地址
                 vxWorks_path = optarg;
+                printf("vxworks path!!%s\n", vxWorks_path);
                 break;
             }
             case QEMU_OPTION_fuzz_entry: {
@@ -4797,8 +4798,8 @@ int main(int argc, char **argv, char **envp)
 
     os_setup_post();
     
-    vxAFL_init();
-    printf("[+] Main loop in thread:%d\n", syscall(__NR_gettid));
+    vxAFL_init(); // 初始化vxAFL相关资源
+
     main_loop();
     replay_disable_events();
     iothread_stop_all();

@@ -13,20 +13,18 @@
     afl_maybe_log(pc); \
   } while (0)
 
-/* We use one additional file descriptor to relay "needs translation"
-   messages between the child and the fork server. */
-
-#define TSL_FD (FORKSRV_FD - 1)
-
 /* This is equivalent to afl-as.h: */
 
 static unsigned char *afl_area_ptr = 0;
-
-/* Exported variables populated by the code patched into elfload.c: */
-
-target_ulong  afl_entry_point = 0x30d4d0, /* ELF entry point (_start) */
-      afl_start_code = 0,  /* .text start pointer      */
-      afl_end_code = 0x30d54c;    /* .text end pointer        */
+extern target_ulong vxAFL_entrypoint;
+extern target_ulong vxAFL_idleEnter;
+extern target_ulong vxAFL_excStub0;
+extern target_ulong vxAFL_excStub;
+extern target_ulong vxAFL_excPanicShow;
+extern target_ulong vxAFL_reschedule;
+// target_ulong  afl_entry_point = 0x30d4d0, /* ELF entry point (_start) */
+target_ulong  afl_start_code = 0;  /* .text start pointer      */
+target_ulong  afl_end_code = 0x30d54c;    /* .text end pointer        */
 
 int aflChildrenStatus = 0; // 子线程执行的状态
 int aflStart = 0;               /* we've started fuzzing */
@@ -43,18 +41,13 @@ typedef enum AFL_STATUS{
 
 AFL_STATUS aflStatus = AFL_WAITTING;
 GHashTable* aflMemHT = NULL;
-/* from command line options */
-const char *aflFile = "/tmp/work";
+
 unsigned long aflPanicAddr = 0xffffffff8105615a;
 unsigned long aflDmesgAddr = (unsigned long)-1;
 
 /* Set in the child process in forkserver mode: */
 
 unsigned char afl_fork_child = 0;
-int afl_wants_cpu_to_stop = 0;
-// unsigned int afl_forksrv_pid;
-
-/* Instrumentation ratio: */
 
 static unsigned int afl_inst_rms = MAP_SIZE;
 
@@ -62,17 +55,35 @@ static unsigned int afl_inst_rms = MAP_SIZE;
 static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc);
 static inline void afl_maybe_log(target_ulong);
 
-static void afl_wait_tsl(CPUArchState*, int);
-static void afl_request_tsl(target_ulong, target_ulong, uint64_t);
+#ifdef CAL_TIME
+static u64 fuzz_count = 0;
+static u64 cur_time = 0;
+static u64 load_cpu_time = 0;
+static u64 load_mem_time = 0;
+static u64 tcg_time = 0;
+static u64 load_testcase_time = 0;
+static u64 afl_log_time = 0;
+static u64 pipe_time = 0;
+static FILE* rt_file = NULL;  // running time file保存运行时间
 
-static TranslationBlock *tb_find_slow(CPUArchState*, target_ulong,
-                                      target_ulong, uint64_t);
-
+static u64 get_cur_time(void) {
+  // 获得当前时间us为单位
+  struct timeval tv;
+  struct timezone tz;
+  gettimeofday(&tv, &tz);
+  return (tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
+}
+static u64 get_cur_time_us(void) {
+  struct timeval tv;
+  struct timezone tz;
+  gettimeofday(&tv, &tz);
+  return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
+}
+#endif
 CPUArchState backupCPUState; // 用于保持的cpu状态
 CPUTLBEntry backupTLBTable[3][256];
 
 void StoreCPUState(CPUArchState* env) {
-  // printf("[SSSS]Store CPU State\n");
   for (int i = 0; i < CPU_NB_REGS; i++) {
     backupCPUState.regs[i] = env->regs[i];
   }
@@ -109,16 +120,17 @@ void StoreCPUState(CPUArchState* env) {
   backupCPUState.sysenter_eip = env->sysenter_eip;
   backupCPUState.star = env->star;
 }
-extern CPUState* restart_cpu;
-static void
-myIterator(gpointer key, gpointer value, gpointer env)
+
+static void myIterator(gpointer key, gpointer value, gpointer env)
 {
   CPUArchState* arch = (CPUArchState*)env;
   cpu_stl_data_ra(arch, *(target_long*)key, *(target_long*)value, NULL);
-  // printf("[restore]key:%ld, value:%ld\n", *(target_long*)key, *(target_long*)value);
 }
 
 void LoadCPUState(CPUArchState* env) {
+#ifdef CAL_TIME
+  u64 cur = get_cur_time();
+#endif
   for (int i = 0; i < CPU_NB_REGS; i++) {
     env->regs[i] = backupCPUState.regs[i];
   }
@@ -154,17 +166,24 @@ void LoadCPUState(CPUArchState* env) {
   env->sysenter_esp = backupCPUState.sysenter_esp;
   env->sysenter_eip = backupCPUState.sysenter_eip;
   env->star = backupCPUState.star;
+#ifdef CAL_TIME
+  load_cpu_time += get_cur_time() - cur;
+  cur = get_cur_time();
+#endif
 
   g_hash_table_foreach(aflMemHT, myIterator, env);
-  // g_hash_table_remove_all(aflMemHT);
+
+#ifdef CAL_TIME
+  load_mem_time += get_cur_time() - cur;
+#endif
 }
 
 FILE *afl_fp = NULL;
 void LoadTestCase(CPUArchState* env) {
-  // printf("[SSSS]load testcase\n");
-  
-  const char* filepath = "/home/ss/work/vxafl/fuzzout/.cur_input";
-  // const char* filepath = "/home/ss/work/vxafl/test_input.txt";
+#ifdef CAL_TIME
+  u64 load_test_begin_time = get_cur_time();
+#endif  
+  const char* filepath = "/home/ss/work/vxafl/example/fuzzout/.cur_input";
   // uintptr_t ra = GETPC();
   // printf("esp addr:%lx, eip addr:%lx\n", env->regs[R_ESP], env->eip);
   target_long ret_ptr = cpu_ldl_data(env, env->regs[R_ESP]);
@@ -178,8 +197,8 @@ void LoadTestCase(CPUArchState* env) {
   
 
   // // FILE *fp;
-  if (!afl_fp)
-    afl_fp = fopen(filepath, "rb");
+  // if (!afl_fp)
+  afl_fp = fopen(filepath, "rb");
   if (!afl_fp) {
     perror("Can't open file");
     exit(-1);
@@ -190,13 +209,16 @@ void LoadTestCase(CPUArchState* env) {
   fseek(afl_fp, 0, SEEK_SET);
   char ch = 0;
   for (int i = 0; i < sz; i++) {
-    // printf("%c", ch);
     if (fread(&ch, 1, 1, afl_fp) == 0) {
       break;
     }
     cpu_stb_data(env, arg_ptr+i, ch);
   }
   // printf("args inject %d\n", sz);
+  fclose(afl_fp);
+#ifdef CAL_TIME
+  load_testcase_time += get_cur_time() - load_test_begin_time;
+#endif
 }
 
 /*************************
@@ -223,15 +245,8 @@ void afl_setup(void) {
   if (id_str) {
     shm_id = atoi(id_str);
     afl_area_ptr = shmat(shm_id, NULL, 0);
-
     if (afl_area_ptr == (void*)-1) exit(1);
-
-    /* With AFL_INST_RATIO set to a low value, we want to touch the bitmap
-       so that the parent doesn't give up on us. */
-
     if (inst_r) afl_area_ptr[0] = 1;
-
-
   }
 }
 
@@ -240,11 +255,9 @@ static inline target_ulong aflHash(target_ulong cur_loc)
   if(!aflStart)
     return 0;
 
-  /* Optimize for cur_loc > afl_end_code, which is the most likely case on
-     Linux systems. */
-
-  // if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
-  //   return 0;
+  // 限制在start至end范围内
+  if (cur_loc > afl_end_code || cur_loc < afl_start_code || !afl_area_ptr)
+    return 0;
 
 #ifdef DEBUG_EDGES
   if(1) {
@@ -252,11 +265,6 @@ static inline target_ulong aflHash(target_ulong cur_loc)
     fflush(stdout);
   }
 #endif
-
-  /* Looks like QEMU always maps to fixed locations, so ASAN is not a
-     concern. Phew. But instruction addresses may be aligned. Let's mangle
-     the value to get something quasi-uniform. */
-
   target_ulong h = cur_loc;
 #if TARGET_LONG_BITS == 32
   h ^= cur_loc >> 16;
@@ -283,15 +291,21 @@ static inline target_ulong aflHash(target_ulong cur_loc)
 
 /* todo: generate calls to helper_aflMaybeLog during translation */
 static inline void helper_aflMaybeLog(target_ulong cur_loc) {
+#ifdef CAL_TIME
+  u64 cur = get_cur_time_us();
+#endif
   static __thread target_ulong prev_loc;
-
   afl_area_ptr[cur_loc ^ prev_loc]++;
   prev_loc = cur_loc >> 1;
+#ifdef CAL_TIME
+  afl_log_time += get_cur_time_us() - cur;
+#endif
 }
 
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(target_ulong cur_loc) {
+  // return;
   if (aflStatus == AFL_START || aflStatus == AFL_DOING) {
     cur_loc = aflHash(cur_loc);
     if(cur_loc)
@@ -302,105 +316,69 @@ unsigned char afl_buffer[4];
 static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc) {
   static unsigned int afl_forksrv_pid = 0;
 
-  if(pc == afl_entry_point && pc && aflStatus == AFL_WAITTING) {
+  if(pc == vxAFL_entrypoint && pc && aflStatus == AFL_WAITTING) {
+#ifdef CAL_TIME
+    rt_file = fopen("/home/ss/work/vxafl/running_time.txt", "w+");
+#endif
+    // printf("afl entry point\n");
     aflStart = 1;
     aflStatus = AFL_START;
-    // afl_wants_cpu_to_stop = 1;
     afl_forksrv_pid = getpid();
-    // printf("[SSSS]AFLSTART pc is %lx\n", pc);
     aflMemHT = g_hash_table_new(g_int_hash, g_int_equal);
     afl_setup();
     StoreCPUState(env);
     aflStatus = AFL_DOING;
     LoadTestCase(env);
+    afl_start_code = vxAFL_entrypoint;
+    afl_end_code = vxAFL_entrypoint + 132;
     /* 通知afl，当前进程仍然存活 */
     if (write(FORKSRV_FD + 1, "Hi!!", 4) != 4) {
       printf("[SSSS]通知afl error\n");
       return;
     }
+#ifdef CAL_TIME
+    cur_time = get_cur_time();
+#endif
   }
   else if (aflStatus == AFL_DOING) {
     // printf("[SSSS]DOING pc:0x%lx\n", pc);
-    if (pc == 0x40a250) {
+    if (pc == vxAFL_idleEnter) {
       // printf("idleEnter\n");
-      afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-    if (pc == 0x3189e0) {
+    if (pc == vxAFL_excStub0) {
       // printf("excStub0 \n");
-      afl_wants_cpu_to_stop = 1;
+      aflChildrenStatus = 0;
+      aflStatus = AFL_DONE;
+    }
+    if (pc == vxAFL_excStub) {
+      // printf("excStub1 \n");
       aflChildrenStatus = 8;
       aflStatus = AFL_DONE;
     }
-    if (pc == 0x40cb30) {
+    if (pc == vxAFL_reschedule) {
       // printf("reschedule\n");
-      afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-    if (pc == 0x00425f40) {
+    if (pc == vxAFL_excPanicShow) { //excPanicShow
       // printf("Panic\n");
-      afl_wants_cpu_to_stop = 1;
       aflChildrenStatus = 0;
       aflStatus = AFL_DONE;
     }
-    if (pc == 0x412c40) {
-      // printf("Task Lock\n");
-      afl_wants_cpu_to_stop = 1;
-      aflChildrenStatus = 0;
-      aflStatus = AFL_DONE;
-    }
-    // if (pc > afl_entry_point + 132) {
-    //   printf("More \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE;
-    // }
-    
-    // if (pc == 0xd41a) {
-    //   exit(1);
-    // }
-    // if (pc == aflPanicAddr) {
-    //   printf("panic \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE; 
-    // }
-    // if (pc >= afl_entry_point + 73) {
-    //   printf("procfs1 end \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE; 
-    // }
-    // if (pc >= 0xffffffff811d21bf) {
-    //   printf("procfs1 ret \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE; 
-    // }
-    // if (pc == 0xffffffff8107f0c2) {
-    //    printf("procfs1 idle \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE; 
-    // }
-    // if (pc == 0xffffffff81085f1b) {
-    //    printf("procfs1 pick_next_entity \n");
-    //   afl_wants_cpu_to_stop = 1;
-    //   aflChildrenStatus = 0;
-    //   aflStatus = AFL_DONE; 
-    // }
   }
   if (aflStatus == AFL_DONE) {
       // printf("[SSSS]Done\n");
-      
+#ifdef CAL_TIME
+      tcg_time += get_cur_time() - cur_time;
+      u64 cur = get_cur_time();
+#endif
       /* Whoops, parent dead? */
       if (read(FORKSRV_FD, afl_buffer, 4) != 4) {
         printf("[SSSS]read fork server error\n");
         exit(2);
       }
-      // printf("[SSSS]parent alive\n");
       if (write(FORKSRV_FD + 1, &afl_forksrv_pid, 4) != 4) {
         printf("[SSSS]write fork server pid error\n");
         exit(5);
@@ -410,11 +388,24 @@ static void afl_check_pc(CPUState* cpu, CPUArchState* env, target_ulong pc) {
           printf("[SSSS]forkserver want to communicate afl failed\n");
           exit(7);
       }
+#ifdef CAL_TIME
+      pipe_time += get_cur_time() - cur;
+      fuzz_count += 1;
+      if (fuzz_count == 10000) {
+        fprintf(rt_file, "%lu %lu %lu %lu %lu %lu %lu %lu\n",
+          cur_time, load_cpu_time, load_mem_time, tcg_time,
+          load_testcase_time, afl_log_time, pipe_time, fuzz_count);
+        exit(0);
+      }
+#endif     
       aflChildrenStatus = 0;
       LoadCPUState(env);
       aflStatus = AFL_DOING;
       LoadTestCase(env);
-    }
+#ifdef CAL_TIME
+      cur_time = get_cur_time();
+#endif
+  }
 }
 
 #define AFL_TRACE_GETPC() ((void *)((unsigned long)__builtin_return_address(0) - 1))
